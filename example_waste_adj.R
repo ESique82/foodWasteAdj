@@ -18,7 +18,7 @@
 # 0. Setup — adjust lca_path to your lcaStats-R folder
 # ---------------------------------------------------------------------------
 
-lca_path <- "path/to/lcaStats-R/"   # <-- change this
+lca_path <- "/home/eric/projects/lcaStats-R/"  # <-- change this
 
 source(paste0(lca_path, "pedigree_R.R"))
 source(paste0(lca_path, "monte_carlo.R"))
