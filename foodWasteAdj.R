@@ -550,3 +550,303 @@ export_waste_results <- function(adjusted,
   message(sprintf("Exported to: %s", file))
   invisible(file)
 }
+
+# ---------------------------------------------------------------------------
+# adjust_for_waste_simple() — standalone entry point (no lcaStats-R needed)
+# ---------------------------------------------------------------------------
+
+#' Adjust point-estimate LCA impacts for food loss and waste
+#'
+#' A standalone entry point that does NOT require \code{run_monte_carlo()}
+#' output from lcaStats-R. Use this when you have impact figures from an
+#' external source (e.g. Agribalyse, Ecoinvent, a published LCA study) and
+#' want to adjust them from per-kg-produced to per-kg-consumed.
+#'
+#' The production impact is treated as a fixed point estimate. Only waste
+#' rate uncertainty is propagated through the Monte Carlo simulation. This
+#' is appropriate when:
+#' \itemize{
+#'   \item You are checking or exploring figures from a waste database
+#'   \item You do not have pedigree scores or GSD² values for the impacts
+#'   \item Your interest is specifically in the sensitivity of consumed-unit
+#'         impacts to waste rate uncertainty
+#' }
+#'
+#' If you also have uncertainty information for the production impacts
+#' (e.g. a coefficient of variation), supply it via the \code{impact_cv}
+#' column in \code{impacts} and set \code{propagate_production_uncertainty
+#' = TRUE}.
+#'
+#' @param impacts Data frame with at minimum two columns:
+#'   \describe{
+#'     \item{food_item}{Character. Name of each food item.}
+#'     \item{impact_mean}{Numeric. Mean LCA impact per kg produced.
+#'       Any impact category (GWP, water use, land use, etc.) and any
+#'       functional unit, as long as it is expressed per kg \emph{produced}.}
+#'     \item{impact_cv}{Numeric (optional). Coefficient of variation for
+#'       the production impact (SD / mean). If supplied and
+#'       \code{propagate_production_uncertainty = TRUE}, production
+#'       uncertainty is modelled as Lognormal and propagated jointly with
+#'       waste rate uncertainty. Ignored otherwise.}
+#'   }
+#' @param waste_df Data frame. Output of \code{\link{load_waste_data}}.
+#' @param food_category_map Named character vector mapping food items to
+#'   waste categories. Names are food items (matching \code{impacts$food_item});
+#'   values are category names matching \code{waste_df$food_category}.
+#'   Example: \code{c("Wheat bread" = "Wheat", "Beef burger" = "Meat")}.
+#' @param n Integer. Number of Monte Carlo iterations. Default 10,000.
+#' @param seed Integer or NULL. Random seed for reproducibility. Default 42.
+#' @param propagate_production_uncertainty Logical. If TRUE and
+#'   \code{impact_cv} is present in \code{impacts}, production impacts are
+#'   drawn from a Lognormal distribution rather than treated as fixed.
+#'   Default FALSE.
+#'
+#' @return A list with the same structure as \code{\link{adjust_for_waste}},
+#'   so all downstream functions (\code{waste_summary_table},
+#'   \code{plot_waste_comparison}, \code{export_waste_results}) work
+#'   identically:
+#'   \describe{
+#'     \item{\code{$produced}}{Summary statistics for impact per kg produced.}
+#'     \item{\code{$consumed}}{Summary statistics for impact per kg consumed.}
+#'     \item{\code{$samples}}{List with \code{produced} and \code{consumed}
+#'       matrices (n rows × food items).}
+#'     \item{\code{$waste_rates}}{Drawn waste rate samples per food item
+#'       and stage.}
+#'     \item{\code{$waste_df}}{The waste data used as input.}
+#'     \item{\code{$meta}}{Run metadata.}
+#'   }
+#'
+#' @examples
+#' \dontrun{
+#' # --- Minimal example: point estimates from Agribalyse ---
+#'
+#' impacts <- data.frame(
+#'   food_item   = c("Wheat bread", "Beef burger", "Whole milk"),
+#'   impact_mean = c(1.124, 17.4, 1.87)   # kg CO2-eq per kg produced
+#' )
+#'
+#' food_category_map <- c(
+#'   "Wheat bread" = "Cereals & bakery",
+#'   "Beef burger" = "Meat",
+#'   "Whole milk"  = "Dairy"
+#' )
+#'
+#' waste_df <- load_waste_data("gustavsson_2011",
+#'                             food_category = "Cereals & bakery")
+#'
+#' results <- adjust_for_waste_simple(
+#'   impacts           = impacts,
+#'   waste_df          = waste_df,
+#'   food_category_map = food_category_map,
+#'   n                 = 10000,
+#'   seed              = 42
+#' )
+#'
+#' waste_summary_table(results)
+#' plot_waste_comparison(results, x_label = "GWP100 (kg CO2-eq per kg food)")
+#' export_waste_results(results, file = "simple_waste_results.xlsx")
+#'
+#'
+#' # --- With production uncertainty (if you have a CV) ---
+#'
+#' impacts_with_cv <- data.frame(
+#'   food_item   = c("Wheat bread", "Beef burger"),
+#'   impact_mean = c(1.124, 17.4),
+#'   impact_cv   = c(0.12, 0.25)   # 12% and 25% coefficient of variation
+#' )
+#'
+#' results_full <- adjust_for_waste_simple(
+#'   impacts                          = impacts_with_cv,
+#'   waste_df                         = waste_df,
+#'   food_category_map                = food_category_map,
+#'   propagate_production_uncertainty = TRUE
+#' )
+#' }
+#'
+#' @seealso \code{\link{adjust_for_waste}} for the full pipeline using
+#'   \code{run_monte_carlo()} output from lcaStats-R.
+#'
+#' @export
+adjust_for_waste_simple <- function(impacts,
+                                    waste_df,
+                                    food_category_map,
+                                    n    = 10000,
+                                    seed = 42,
+                                    propagate_production_uncertainty = FALSE) {
+  
+  # --- Input validation -------------------------------------------------------
+  
+  if (!is.data.frame(impacts)) {
+    stop("'impacts' must be a data frame.")
+  }
+  required_cols <- c("food_item", "impact_mean")
+  missing_cols  <- setdiff(required_cols, names(impacts))
+  if (length(missing_cols) > 0) {
+    stop(sprintf("'impacts' is missing required column(s): %s",
+                 paste(missing_cols, collapse = ", ")))
+  }
+  if (any(impacts$impact_mean <= 0)) {
+    stop("All values in 'impact_mean' must be positive.")
+  }
+  if (!is.character(food_category_map) || is.null(names(food_category_map))) {
+    stop("'food_category_map' must be a named character vector.")
+  }
+  unmapped <- setdiff(impacts$food_item, names(food_category_map))
+  if (length(unmapped) > 0) {
+    stop(sprintf(
+      "The following food items have no entry in food_category_map: %s",
+      paste(unmapped, collapse = ", ")))
+  }
+  
+  if (propagate_production_uncertainty) {
+    if (!"impact_cv" %in% names(impacts)) {
+      warning(paste0(
+        "propagate_production_uncertainty = TRUE but 'impact_cv' column not ",
+        "found in impacts. Falling back to fixed point estimates."))
+      propagate_production_uncertainty <- FALSE
+    } else if (any(impacts$impact_cv <= 0, na.rm = TRUE)) {
+      stop("All values in 'impact_cv' must be positive.")
+    }
+  }
+  
+  # --- Set seed ---------------------------------------------------------------
+  
+  if (!is.null(seed)) set.seed(seed)
+  
+  food_items <- impacts$food_item
+  n_items    <- length(food_items)
+  
+  # --- Step 1: build produced_samples matrix (n × n_items) -------------------
+  #
+  # If propagate_production_uncertainty = FALSE  → replicate the point estimate
+  #   n times (constant column). Only waste uncertainty contributes.
+  #
+  # If propagate_production_uncertainty = TRUE   → draw from Lognormal using
+  #   mean and CV. Both sources of uncertainty contribute.
+  
+  produced_samples <- matrix(NA_real_, nrow = n, ncol = n_items,
+                             dimnames = list(NULL, food_items))
+  
+  for (j in seq_along(food_items)) {
+    mu <- impacts$impact_mean[j]
+    
+    if (propagate_production_uncertainty && "impact_cv" %in% names(impacts)) {
+      cv       <- impacts$impact_cv[j]
+      sigma_ln <- sqrt(log(cv^2 + 1))
+      mu_ln    <- log(mu) - sigma_ln^2 / 2
+      produced_samples[, j] <- rlnorm(n, meanlog = mu_ln, sdlog = sigma_ln)
+    } else {
+      produced_samples[, j] <- rep(mu, n)
+    }
+  }
+  
+  # --- Step 2: draw waste rates and compute consumed samples ------------------
+  #
+  # Identical logic to adjust_for_waste() — Beta draws per stage per iteration.
+  
+  consumed_samples <- matrix(NA_real_, nrow = n, ncol = n_items,
+                             dimnames = list(NULL, food_items))
+  
+  waste_rate_draws <- vector("list", n_items)
+  names(waste_rate_draws) <- food_items
+  
+  for (j in seq_along(food_items)) {
+    
+    category <- food_category_map[food_items[j]]
+    item_waste <- waste_df[waste_df$food_category == category, ]
+    
+    if (nrow(item_waste) == 0) {
+      stop(sprintf(
+        "No waste data found for category '%s' (mapped from '%s'). ",
+        "Check food_category_map and waste_df$food_category.",
+        category, food_items[j]))
+    }
+    
+    # Draw waste rates for each stage — Beta(alpha, beta) per iteration
+    survival <- matrix(1, nrow = n, ncol = 1)   # cumulative survival fraction
+    stage_draws <- list()
+    
+    for (s in STAGES) {
+      row <- item_waste[item_waste$stage == s, ]
+      
+      if (nrow(row) == 0 || is.na(row$waste_mean) || is.na(row$waste_sd)) {
+        # Stage not available for this category — assume zero loss
+        stage_draws[[s]] <- rep(0, n)
+        next
+      }
+      
+      params        <- beta_params(row$waste_mean, row$waste_sd)
+      draws         <- rbeta(n, params["alpha"], params["beta"])
+      stage_draws[[s]] <- draws
+      survival      <- survival * (1 - draws)
+    }
+    
+    waste_rate_draws[[j]] <- as.data.frame(stage_draws)
+    
+    # Consumed impact = produced impact / survival fraction
+    consumed_samples[, j] <- produced_samples[, j] / as.numeric(survival)
+  }
+  
+  # --- Step 3: summarise ------------------------------------------------------
+  
+  summarise_samples <- function(mat, ci = 0.95) {
+    alpha <- (1 - ci) / 2
+    do.call(rbind, lapply(colnames(mat), function(item) {
+      x <- mat[, item]
+      data.frame(
+        food_item = item,
+        mean      = mean(x),
+        sd        = sd(x),
+        median    = median(x),
+        ci_lower  = quantile(x, alpha),
+        ci_upper  = quantile(x, 1 - alpha),
+        stringsAsFactors = FALSE,
+        row.names = NULL
+      )
+    }))
+  }
+  
+  produced_summary <- summarise_samples(produced_samples)
+  consumed_summary <- summarise_samples(consumed_samples)
+  
+  # --- Step 4: waste rate summary (mirrors adjust_for_waste output) -----------
+  
+  waste_rates_summary <- do.call(rbind, lapply(seq_along(food_items), function(j) {
+    draws <- waste_rate_draws[[j]]
+    do.call(rbind, lapply(names(draws), function(s) {
+      x <- draws[[s]]
+      data.frame(
+        food_item = food_items[j],
+        stage     = s,
+        mean      = mean(x),
+        sd        = sd(x),
+        ci_lower  = quantile(x, 0.025),
+        ci_upper  = quantile(x, 0.975),
+        stringsAsFactors = FALSE,
+        row.names = NULL
+      )
+    }))
+  }))
+  
+  # --- Return -----------------------------------------------------------------
+  
+  list(
+    produced    = produced_summary,
+    consumed    = consumed_summary,
+    samples     = list(
+      produced  = produced_samples,
+      consumed  = consumed_samples
+    ),
+    waste_rates = waste_rates_summary,
+    waste_df    = waste_df,
+    meta        = list(
+      n                                = n,
+      seed                             = seed,
+      food_items                       = food_items,
+      food_category_map                = food_category_map,
+      propagate_production_uncertainty = propagate_production_uncertainty,
+      entry_point                      = "adjust_for_waste_simple",
+      timestamp                        = Sys.time()
+    )
+  )
+}

@@ -103,7 +103,79 @@ plot_waste_comparison(adjusted, x_label = "GWP100 (kg CO2-eq per kg food)")
 See `example_waste_adj.R` for a full two-product worked example.
 
 ---
+---
 
+## Standalone use — no lcaStats-R required
+
+`adjust_for_waste_simple()` is an alternative entry point that does **not** require Monte Carlo output from lcaStats-R. Use it when you have impact figures from an external source (Agribalyse, Ecoinvent, a published LCA study, or a waste database) and want to adjust them from per-kg-produced to per-kg-consumed.
+
+The production impact is treated as a fixed point estimate. Only waste rate uncertainty is propagated through the simulation. This is the correct approach when:
+- You are exploring or sense-checking figures from a waste or LCA database
+- You do not have pedigree scores or GSD² values for the impacts
+- Your interest is specifically the sensitivity of consumed-unit impacts to waste rate uncertainty
+
+### Minimal example
+
+```r
+source("foodWasteAdj.R")
+
+# Impact figures from any external source
+impacts <- data.frame(
+  food_item   = c("Wheat bread", "Beef burger", "Whole milk"),
+  impact_mean = c(1.124, 17.4, 1.87)   # kg CO2-eq per kg produced
+)
+
+# Map food items to waste categories in your chosen waste data source
+food_category_map <- c(
+  "Wheat bread" = "Cereals & bakery",
+  "Beef burger" = "Meat",
+  "Whole milk"  = "Dairy"
+)
+
+# Load waste rates
+waste_df <- load_waste_data("gustavsson_2011")
+
+# Run adjustment — only waste uncertainty propagated
+results <- adjust_for_waste_simple(
+  impacts           = impacts,
+  waste_df          = waste_df,
+  food_category_map = food_category_map,
+  n                 = 10000,
+  seed              = 42
+)
+
+# All downstream functions work identically to the full pipeline
+waste_summary_table(results)
+plot_waste_comparison(results, x_label = "GWP100 (kg CO2-eq per kg food)")
+export_waste_results(results, file = "results.xlsx")
+```
+
+### Optional: propagate production uncertainty too
+
+If you also have a coefficient of variation (CV = SD / mean) for the production impacts, you can propagate both sources of uncertainty jointly:
+
+```r
+impacts_with_cv <- data.frame(
+  food_item   = c("Wheat bread", "Beef burger"),
+  impact_mean = c(1.124, 17.4),
+  impact_cv   = c(0.12, 0.25)   # 12% and 25% CV
+)
+
+results <- adjust_for_waste_simple(
+  impacts                          = impacts_with_cv,
+  waste_df                         = waste_df,
+  food_category_map                = food_category_map,
+  propagate_production_uncertainty = TRUE
+)
+```
+
+### When to use which entry point
+
+| Situation | Function to use |
+|---|---|
+| You have inventory data with pedigree scores | `adjust_for_waste()` via full lcaStats-R pipeline |
+| You have point estimates from an external DB | `adjust_for_waste_simple()` |
+| You have point estimates + CV from literature | `adjust_for_waste_simple(..., propagate_production_uncertainty = TRUE)` |
 ## Functions
 
 | Function | Description |
